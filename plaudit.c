@@ -5,7 +5,7 @@
  * and fully-qualified object names for all DML and DDL statements where possible
  * (See README.md for details).
  *
- * Copyright (c) 2025-2025, PostgreSQL Global Development Group
+ * Copyright (c) 2024-2025, PostgreSQL Global Development Group
  *------------------------------------------------------------------------------
  */
 #include "postgres.h"
@@ -50,18 +50,14 @@ static char *auditLog = NULL;
 /*
  * GUC variable for plaudit.log_catalog
  *
- * Administrators can choose to NOT log queries when all relations used in
- * the query are in pg_catalog.  Interactive sessions (eg: psql) can cause
- * a lot of noise in the logs which might be uninteresting.
+ * Log queries or not when relations used in the query are in pg_catalog.
  */
 static bool auditLogCatalog = true;
 
 /*
  * GUC variable for plaudit.log_relation
- *
- * Administrators can choose, in SESSION logging, to log each relation involved
- * in READ/WRITE class queries.  By default, SESSION logs include the query but
- * do not have a log entry for each relation.
+ * 
+ * Log each relation separately when relation involved in READ/WRITE class queries.
  */
 static bool auditLogRelation = false;
 
@@ -75,9 +71,7 @@ static bool auditLogStatement = true;
 /*
  * GUC variable for plaudit.role
  *
- * Administrators can choose which role to base OBJECT auditing off of.
- * Object-level auditing uses the privileges which are granted to this role to
- * determine if a statement should be logged.
+ * Master role.
  */
 static char *auditRole = NULL;
 
@@ -88,7 +82,6 @@ static ExecutorCheckPerms_hook_type next_ExecutorCheckPerms_hook = NULL;
 static ProcessUtility_hook_type next_ProcessUtility_hook = NULL;
 static object_access_hook_type next_object_access_hook = NULL;
 static ExecutorStart_hook_type next_ExecutorStart_hook = NULL;
-
 
 /*
  * Hook ExecutorStart to get the query text and basic command type for queries
