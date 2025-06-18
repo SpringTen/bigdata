@@ -4,7 +4,7 @@ MODULE_big = plaudit
 OBJS = plaudit.o $(WIN32RES)
 
 EXTENSION = plaudit
-DATA = plaudit--1.0.0.sql
+DATA = plaudit--1.0.sql
 PGFILEDESC = "plaudit - An audit logging extension for PostgreSQL"
 
 REGRESS = plaudit
