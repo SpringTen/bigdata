@@ -1,5 +1,5 @@
 /*------------------------------------------------------------------------------
- * plaudit.c
+ * polar_audit.c
  *
  * An audit logging extension for PostgreSQL. Provides detailed logging classes,
  * and fully-qualified object names for all DML and DDL statements where possible
@@ -44,25 +44,66 @@ PG_MODULE_MAGIC;
 
 void		_PG_init(void);
 
-/* GUC variable for plaudit.log, which defines the classes to log. */
-static char *auditLog = NULL;
+/* Bits within auditLogBitmap */
+#define LOG_DDL         (1 << 0)	/* CREATE/DROP/ALTER */
+#define LOG_FUNCTION    (1 << 1)	/* Functions and DO blocks */
+#define LOG_MISC        (1 << 2)	/* Statements which not covered */
+#define LOG_READ        (1 << 3)	/* SELECT */
+#define LOG_ROLE        (1 << 4)	/* GRANT/REVOKE, CREATE/DROP/ALTER ROLE */
+#define LOG_WRITE       (1 << 5)	/* INSERT, DELETE, UPDATE, TRUNCATE */
+#define LOG_MISC_SET    (1 << 6)	/* SET ... */
+
+#define LOG_NONE        0		/* empty */
+#define LOG_ALL         (0xFFFFFFFF)	/* All above */
+
+/* String tokens constants for log classes */
+#define CLASS_DDL       "DDL"
+#define CLASS_FUNCTION  "FUNCTION"
+#define CLASS_MISC      "MISC"
+#define CLASS_MISC_SET  "MISC_SET"
+#define CLASS_READ      "READ"
+#define CLASS_ROLE      "ROLE"
+#define CLASS_WRITE     "WRITE"
+
+#define CLASS_NONE      "NONE"
+#define CLASS_ALL       "ALL"
 
 /*
- * GUC variable for plaudit.log_catalog
+ * Object type, used for SELECT/DML statements and function calls.
+ */
+#define OBJECT_TYPE_TABLE           "TABLE"
+#define OBJECT_TYPE_INDEX           "INDEX"
+#define OBJECT_TYPE_SEQUENCE        "SEQUENCE"
+#define OBJECT_TYPE_TOASTVALUE      "TOAST TABLE"
+#define OBJECT_TYPE_VIEW            "VIEW"
+#define OBJECT_TYPE_MATVIEW         "MATERIALIZED VIEW"
+#define OBJECT_TYPE_COMPOSITE_TYPE  "COMPOSITE TYPE"
+#define OBJECT_TYPE_FOREIGN_TABLE   "FOREIGN TABLE"
+#define OBJECT_TYPE_FUNCTION        "FUNCTION"
+
+#define OBJECT_TYPE_UNKNOWN         "UNKNOWN"
+
+/* GUC variable for polar_audit.log, which defines the classes to log. */
+static char *auditLog = NULL;
+
+static int	auditLogBitmap = LOG_NONE;
+
+/*
+ * GUC variable for polar_audit.log_catalog
  *
  * Log queries or not when relations used in the query are in pg_catalog.
  */
 static bool auditLogCatalog = true;
 
 /*
- * GUC variable for plaudit.log_relation
+ * GUC variable for polar_audit.log_relation
  *
  * Log each relation separately when relation involved in READ/WRITE class queries.
  */
 static bool auditLogRelation = false;
 
 /*
- * GUC variable for plaudit.log_parameter
+ * GUC variable for polar_audit.log_parameter
  *
  * Administrators can choose if parameters passed into a statement are
  * included in the audit log.
@@ -70,14 +111,14 @@ static bool auditLogRelation = false;
 static bool auditLogParameter = false;
 
 /*
- * GUC variable for plaudit.log_statement
+ * GUC variable for polar_audit.log_statement
  *
  * Administrators can choose to not have the full statement text logged.
  */
 static bool auditLogStatement = true;
 
 /*
- * GUC variable for plaudit.role
+ * GUC variable for polar_audit.role
  *
  * Master role.
  */
@@ -183,7 +224,7 @@ stack_push()
 	 * destroyed.
 	 */
 	contextAudit = AllocSetContextCreate(CurrentMemoryContext,
-										 "plaudit stack context",
+										 "polar_audit stack context",
 										 ALLOCSET_DEFAULT_SIZES);
 
 	/* Save the old context to switch back to at the end */
@@ -227,8 +268,17 @@ stack_pop(int64 stackId)
 	if (auditEventStack != NULL && auditEventStack->stackId == stackId)
 		MemoryContextDelete(auditEventStack->contextAudit);
 	else
-		elog(ERROR, "plaudit stack item " INT64_FORMAT " not found on top - cannot pop",
+		elog(ERROR, "polar_audit stack item " INT64_FORMAT " not found on top - cannot pop",
 			 stackId);
+}
+
+/*
+ * Gets an AuditEvent, classifies it, then logs it if appropriate.
+ */
+static void
+log_audit_event(AuditEventStackItem * stackItem)
+{
+	/* avoid warning */
 }
 
 /*
@@ -237,18 +287,197 @@ stack_pop(int64 stackId)
  * ExecutorCheckPerms.
  */
 static void
-plaudit_ExecutorStart_hook(QueryDesc *queryDesc, int eflags)
+polar_audit_ExecutorStart_hook(QueryDesc *queryDesc, int eflags)
 {
 	return;
 }
 
 /*
- * Hook ExecutorCheckPerms to do session and object auditing for DML.
+ * Create AuditEvents for SELECT/DML operations via executor permissions checks.
+ */
+static void
+log_select_dml(Oid auditOid, List *rangeTabls)
+{
+	ListCell   *lr;
+	bool		first = true;
+	bool		found = false;
+
+	foreach(lr, rangeTabls)
+	{
+		Oid			relOid;
+		Oid			relNamespaceOid;
+		RangeTblEntry *rte = lfirst(lr);
+
+		/*
+		 * We only care about tables, and can ignore subqueries etc. Also
+		 * detect and skip partitions by checking for missing requiredPerms.
+		 */
+		if (rte->rtekind != RTE_RELATION || rte->requiredPerms == 0)
+			continue;
+
+		found = true;
+
+		/*
+		 * Don't log if the session user is not a member of the current role.
+		 * This prevents contents of security definer functions from being
+		 * logged and suppresses foreign key queries unless the session user
+		 * is the owner of the referenced table.
+		 */
+		if (!is_member_of_role(GetSessionUserId(), GetUserId()))
+			return;
+
+		/*
+		 * If we are not logging all-catalog queries (auditLogCatalog is
+		 * false) then filter out any system relations here.
+		 */
+		relOid = rte->relid;
+		relNamespaceOid = get_rel_namespace(relOid);
+
+		if (!auditLogCatalog && IsCatalogNamespace(relNamespaceOid))
+			continue;
+
+		/*
+		 * If this is the first RTE then session log unless auditLogRelation
+		 * is set.
+		 */
+		if (first && !auditLogRelation)
+		{
+			log_audit_event(auditEventStack);
+
+			first = false;
+		}
+
+		/*
+		 * We don't have access to the parse tree here, so we have to generate
+		 * the node type, object type, and command tag by decoding
+		 * rte->requiredPerms and rte->relkind. For updates we also check
+		 * rellockmode so that only true UPDATE commands (not SELECT FOR
+		 * UPDATE, etc.) are logged as UPDATE.
+		 */
+		if (rte->requiredPerms & ACL_INSERT)
+		{
+			auditEventStack->auditEvent.logStmtLevel = LOGSTMT_MOD;
+			auditEventStack->auditEvent.commandTag = T_InsertStmt;
+			auditEventStack->auditEvent.command = CMDTAG_INSERT;
+		}
+		else if (rte->requiredPerms & ACL_UPDATE &&
+				 rte->rellockmode >= RowExclusiveLock)
+		{
+			auditEventStack->auditEvent.logStmtLevel = LOGSTMT_MOD;
+			auditEventStack->auditEvent.commandTag = T_UpdateStmt;
+			auditEventStack->auditEvent.command = CMDTAG_UPDATE;
+		}
+		else if (rte->requiredPerms & ACL_DELETE)
+		{
+			auditEventStack->auditEvent.logStmtLevel = LOGSTMT_MOD;
+			auditEventStack->auditEvent.commandTag = T_DeleteStmt;
+			auditEventStack->auditEvent.command = CMDTAG_DELETE;
+		}
+		else if (rte->requiredPerms & ACL_SELECT)
+		{
+			auditEventStack->auditEvent.logStmtLevel = LOGSTMT_ALL;
+			auditEventStack->auditEvent.commandTag = T_SelectStmt;
+			auditEventStack->auditEvent.command = CMDTAG_SELECT;
+		}
+		else
+		{
+			auditEventStack->auditEvent.logStmtLevel = LOGSTMT_ALL;
+			auditEventStack->auditEvent.commandTag = T_Invalid;
+			auditEventStack->auditEvent.command = CMDTAG_UNKNOWN;
+		}
+
+		/* Use the relation type to assign object type */
+		switch (rte->relkind)
+		{
+			case RELKIND_RELATION:
+			case RELKIND_PARTITIONED_TABLE:
+				auditEventStack->auditEvent.objectType = OBJECT_TYPE_TABLE;
+				break;
+
+			case RELKIND_INDEX:
+			case RELKIND_PARTITIONED_INDEX:
+				auditEventStack->auditEvent.objectType = OBJECT_TYPE_INDEX;
+				break;
+
+			case RELKIND_SEQUENCE:
+				auditEventStack->auditEvent.objectType = OBJECT_TYPE_SEQUENCE;
+				break;
+
+			case RELKIND_TOASTVALUE:
+				auditEventStack->auditEvent.objectType = OBJECT_TYPE_TOASTVALUE;
+				break;
+
+			case RELKIND_VIEW:
+				auditEventStack->auditEvent.objectType = OBJECT_TYPE_VIEW;
+				break;
+
+			case RELKIND_COMPOSITE_TYPE:
+				auditEventStack->auditEvent.objectType = OBJECT_TYPE_COMPOSITE_TYPE;
+				break;
+
+			case RELKIND_FOREIGN_TABLE:
+				auditEventStack->auditEvent.objectType = OBJECT_TYPE_FOREIGN_TABLE;
+				break;
+
+			case RELKIND_MATVIEW:
+				auditEventStack->auditEvent.objectType = OBJECT_TYPE_MATVIEW;
+				break;
+
+			default:
+				auditEventStack->auditEvent.objectType = OBJECT_TYPE_UNKNOWN;
+				break;
+		}
+
+		/* Get a copy of the relation name and assign it to object name */
+		auditEventStack->auditEvent.objectName =
+			quote_qualified_identifier(
+									   get_namespace_name(relNamespaceOid), get_rel_name(relOid));
+
+		/* Do relation level logging if auditLogRelation is set */
+		if (auditLogRelation)
+		{
+			auditEventStack->auditEvent.logged = false;
+			log_audit_event(auditEventStack);
+		}
+
+		pfree(auditEventStack->auditEvent.objectName);
+	}
+
+	/*
+	 * If no tables were found that means that RangeTbls was empty or all
+	 * relations were in the system schema.  In that case still log a record.
+	 */
+	if (!found)
+	{
+		auditEventStack->auditEvent.logged = false;
+
+		log_audit_event(auditEventStack);
+	}
+}
+
+/*
+ * Hook ExecutorCheckPerms to do auditing for DML.
  */
 static bool
-plaudit_ExecutorCheckPerms_hook(List *rangeTabls, bool abort)
+polar_audit_ExecutorCheckPerms_hook(List *rangeTabls, bool abort)
 {
-	return false;
+	Oid			auditOid;
+
+	/* Get the audit oid if the role exists */
+	auditOid = get_role_oid(auditRole, true);
+	auditEventStack->auditEvent.auditOid = auditOid;
+
+	/* Log DML if the audit role is valid or logging is enabled */
+	if ((auditOid != InvalidOid || auditLogBitmap != 0) &&
+		!IsAbortedTransactionBlockState())
+		log_select_dml(auditOid, rangeTabls);
+
+	/* Call the next hook function */
+	if (next_ExecutorCheckPerms_hook &&
+		!(*next_ExecutorCheckPerms_hook) (rangeTabls, abort))
+		return false;
+
+	return true;
 }
 
 
@@ -256,14 +485,14 @@ plaudit_ExecutorCheckPerms_hook(List *rangeTabls, bool abort)
  * Hook ProcessUtility to do session auditing for DDL and utility commands.
  */
 static void
-plaudit_ProcessUtility_hook(PlannedStmt *pstmt,
-							const char *queryString,
-							bool readOnlyTree,
-							ProcessUtilityContext context,
-							ParamListInfo params,
-							QueryEnvironment *queryEnv,
-							DestReceiver *dest,
-							QueryCompletion *qc)
+polar_audit_ProcessUtility_hook(PlannedStmt *pstmt,
+								const char *queryString,
+								bool readOnlyTree,
+								ProcessUtilityContext context,
+								ParamListInfo params,
+								QueryEnvironment *queryEnv,
+								DestReceiver *dest,
+								QueryCompletion *qc)
 {
 	return;
 }
@@ -273,16 +502,109 @@ plaudit_ProcessUtility_hook(PlannedStmt *pstmt,
  * calls.
  */
 static void
-plaudit_object_access_hook(ObjectAccessType access,
-						   Oid classId,
-						   Oid objectId,
-						   int subId,
-						   void *arg)
+polar_audit_object_access_hook(ObjectAccessType access,
+							   Oid classId,
+							   Oid objectId,
+							   int subId,
+							   void *arg)
 {
 	/* Temporary code to avoid compile warning. */
 	stack_push();
 	stack_pop(0);
 	return;
+}
+
+/*
+ * GUC check functions.
+ * Take a polar_audit.log value such as "read, write, dml", verify that each of the
+ * comma-separated tokens corresponds to a LogClass value, and convert them into
+ * a bitmap that log_audit_event can check.
+ */
+static bool
+check_polar_audit_log(char **newVal, void **extra, GucSource source)
+{
+	List	   *flagRawList;
+	char	   *rawVal;
+	ListCell   *lt;
+	int		   *flags;
+
+	rawVal = pstrdup(*newVal);
+	if (!SplitIdentifierString(rawVal, ',', &flagRawList))
+	{
+		GUC_check_errdetail("List syntax is invalid");
+		list_free(flagRawList);
+		pfree(rawVal);
+		return false;
+	}
+
+	if (!(flags = (int *) malloc(sizeof(int))))
+		return false;
+
+	*flags = 0;
+
+	foreach(lt, flagRawList)
+	{
+		char	   *token = (char *) lfirst(lt);
+		bool		subtract = false;
+		int			class;
+
+		/* If token is preceded by -, then the token is subtractive */
+		if (token[0] == '-')
+		{
+			token++;
+			subtract = true;
+		}
+
+		/* Test each token */
+		if (pg_strcasecmp(token, CLASS_NONE) == 0)
+			class = LOG_NONE;
+		else if (pg_strcasecmp(token, CLASS_ALL) == 0)
+			class = LOG_ALL;
+		else if (pg_strcasecmp(token, CLASS_DDL) == 0)
+			class = LOG_DDL;
+		else if (pg_strcasecmp(token, CLASS_FUNCTION) == 0)
+			class = LOG_FUNCTION;
+		else if (pg_strcasecmp(token, CLASS_MISC) == 0)
+			class = LOG_MISC | LOG_MISC_SET;
+		else if (pg_strcasecmp(token, CLASS_MISC_SET) == 0)
+			class = LOG_MISC_SET;
+		else if (pg_strcasecmp(token, CLASS_READ) == 0)
+			class = LOG_READ;
+		else if (pg_strcasecmp(token, CLASS_ROLE) == 0)
+			class = LOG_ROLE;
+		else if (pg_strcasecmp(token, CLASS_WRITE) == 0)
+			class = LOG_WRITE;
+		else
+		{
+			free(flags);
+			pfree(rawVal);
+			list_free(flagRawList);
+			return false;
+		}
+
+		/* Add or subtract class bits from the bitmap */
+		if (subtract)
+			*flags &= ~class;
+		else
+			*flags |= class;
+	}
+
+	pfree(rawVal);
+	list_free(flagRawList);
+
+	*extra = flags;
+
+	return true;
+}
+
+/*
+ * GUC assign functions.
+ */
+static void
+assign_polar_audit_log(const char *newVal, void *extra)
+{
+	if (extra)
+		auditLogBitmap = *(int *) extra;
 }
 
 /*
@@ -300,11 +622,11 @@ _PG_init(void)
 	/* Must be loaded with shared_preload_libraries */
 	if (!process_shared_preload_libraries_in_progress)
 		ereport(ERROR, (errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
-						errmsg("plaudit must be loaded via shared_preload_libraries")));
+						errmsg("polar_audit must be loaded via shared_preload_libraries")));
 
-	/* Define plaudit.log */
+	/* Define polar_audit.log */
 	DefineCustomStringVariable(
-							   "plaudit.log",
+							   "polar_audit.log",
 
 							   "Specifies which classes of statements will be logged by audit logging. "
 							   "Multiple classes can be provided using a comma-separated list and "
@@ -315,13 +637,13 @@ _PG_init(void)
 							   "none",
 							   PGC_SUSET,
 							   GUC_LIST_INPUT | GUC_NOT_IN_SAMPLE,
-							   NULL,
-							   NULL,
+							   check_polar_audit_log,
+							   assign_polar_audit_log,
 							   NULL);
 
-	/* Define plaudit.log_catalog */
+	/* Define polar_audit.log_catalog */
 	DefineCustomBoolVariable(
-							 "plaudit.log_catalog",
+							 "polar_audit.log_catalog",
 
 							 "Specifies that logging should be enabled in the case where all "
 							 "relations in a statement are in pg_catalog. Disabling this setting "
@@ -335,9 +657,9 @@ _PG_init(void)
 							 GUC_NOT_IN_SAMPLE,
 							 NULL, NULL, NULL);
 
-	/* Define plaudit.log_relation */
+	/* Define polar_audit.log_relation */
 	DefineCustomBoolVariable(
-							 "plaudit.log_relation",
+							 "polar_audit.log_relation",
 
 							 "Specifies whether audit logging should create a separate log entry "
 							 "for each relation referenced in a SELECT or DML statement.",
@@ -349,9 +671,9 @@ _PG_init(void)
 							 GUC_NOT_IN_SAMPLE,
 							 NULL, NULL, NULL);
 
-	/* Define plaudit.log_statement */
+	/* Define polar_audit.log_statement */
 	DefineCustomBoolVariable(
-							 "plaudit.log_statement",
+							 "polar_audit.log_statement",
 
 							 "Specifies whether logging will include the statement text and "
 							 "parameters. Depending on settings, the full statement text might "
@@ -364,9 +686,9 @@ _PG_init(void)
 							 GUC_NOT_IN_SAMPLE,
 							 NULL, NULL, NULL);
 
-	/* Define plaudit.log_parameter */
+	/* Define polar_audit.log_parameter */
 	DefineCustomBoolVariable(
-							 "plaudit.log_parameter",
+							 "polar_audit.log_parameter",
 
 							 "Specifies that audit logging should include the parameters that were "
 							 "passed into the statement. When parameters are present they will be "
@@ -379,9 +701,9 @@ _PG_init(void)
 							 GUC_NOT_IN_SAMPLE,
 							 NULL, NULL, NULL);
 
-	/* Define plaudit.role */
+	/* Define polar_audit.role */
 	DefineCustomStringVariable(
-							   "plaudit.role",
+							   "polar_audit.role",
 
 							   "Specifies the master role to use for audit logging.  Multiple audit "
 							   "roles can be defined by granting the master role to them. Only the "
@@ -399,21 +721,21 @@ _PG_init(void)
 	 * preserve the chains.
 	 */
 	next_ExecutorStart_hook = ExecutorStart_hook;
-	ExecutorStart_hook = plaudit_ExecutorStart_hook;
+	ExecutorStart_hook = polar_audit_ExecutorStart_hook;
 
 	next_ExecutorCheckPerms_hook = ExecutorCheckPerms_hook;
-	ExecutorCheckPerms_hook = plaudit_ExecutorCheckPerms_hook;
+	ExecutorCheckPerms_hook = polar_audit_ExecutorCheckPerms_hook;
 
 	next_ProcessUtility_hook = ProcessUtility_hook;
-	ProcessUtility_hook = plaudit_ProcessUtility_hook;
+	ProcessUtility_hook = polar_audit_ProcessUtility_hook;
 
 	next_object_access_hook = object_access_hook;
-	object_access_hook = plaudit_object_access_hook;
+	object_access_hook = polar_audit_object_access_hook;
 
 #ifndef EXEC_BACKEND
-	ereport(LOG, (errmsg("plaudit extension initialized")));
+	ereport(LOG, (errmsg("polar_audit extension initialized")));
 #else
-	ereport(DEBUG1, (errmsg("plaudit extension initialized")));
+	ereport(DEBUG1, (errmsg("polar_audit extension initialized")));
 #endif							/* EXEC_BACKEND */
 
 	inited = true;
